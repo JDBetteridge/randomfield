@@ -6,6 +6,7 @@ from firedrake.petsc import PETSc
 
 import ufl
 import numpy as np
+import matplotlib.pyplot as plt
 
 ## Extrct the PETSc matrix
 def get_PETSC_matrix(form, **kwargs):
@@ -53,6 +54,9 @@ def matern(V, variance=1, smoothness=1, correlation_length=1, rg=None):
     mass = inner(u, v)*dx
 
     M = assemble(mass).M
+    print(M.handle.type)
+    iset = PETSc.IS().createGeneral(range(M.nrows), comm=COMM_SELF)
+    M.handle.factorCholesky(iset)
 
     M = get_np_matrix(mass)
     H = cholesky(M)
@@ -62,6 +66,29 @@ def matern(V, variance=1, smoothness=1, correlation_length=1, rg=None):
     l = Constant(eta)*inner(HWnoise, v)*dx
 
     u_h = Function(V)
-    solve(a == l, u_h, solver_parameters={'ksp_type': 'cg', 'pc_type': 'gamg'})
+    solve(a == l, u_h, bcs=bcs, solver_parameters={'ksp_type': 'cg', 'pc_type': 'gamg'})
 
     return u_h
+
+mesh = UnitSquareMesh(50, 50)
+V = FunctionSpace(mesh, 'DG', 2)
+
+broken_elements = ufl.MixedElement([ufl.BrokenElement(Vi.ufl_element()) for Vi in V])
+V_d = FunctionSpace(mesh, broken_elements)
+
+random = matern(V_d)
+if mesh.comm.rank == 0:
+    fig, ax = plt.subplots(1, 1)
+    tripcolor(random, axes=ax)
+    plt.show()
+
+# ~ randomlist = []
+# ~ for l in [1, 0.5, 0.25, 0.125, 0.06125, 0.0000001]:
+    # ~ randomlist.append(matern(V, correlation_length=l))
+
+# ~ fig, ax = plt.subplots(2, 3)
+
+# ~ for ii, axes in enumerate(ax.flatten()):
+    # ~ tripcolor(randomlist[ii], axes=axes)
+
+# ~ plt.show()
