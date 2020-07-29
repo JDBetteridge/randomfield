@@ -9,14 +9,17 @@ extern void dpotrf_(char *UPLO,
 
 int main(){
     char uplo[1];
-    int i = 0;
+    int i = 0, j = 0;
     int N = 3, LDA = 3, INFO = 0;
     double A[9] = {4, 12, -16, 12, 37, -43, -16, -43, 98};
 
     uplo[0] = 'u';
 
     for(i=0; i<3; i++){
-        printf("%g  %g  %g\n", A[3*i], A[3*i+1], A[3*i+2]);
+        for(j=0; j<3; j++){
+            printf("%g\t", A[3*i+j]);
+        }
+        printf("\n");
     }
     printf("\n");
 
@@ -28,8 +31,12 @@ int main(){
 
 
     for(i=0; i<3; i++){
-        printf("%g  %g  %g\n", A[3*i], A[3*i+1], A[3*i+2]);
+        for(j=0; j<3; j++){
+            printf("%g\t", A[3*i+j]);
+        }
+        printf("\n");
     }
+    printf("\n");
 
     return 0;
 }

@@ -14,20 +14,24 @@ import matplotlib.pyplot as plt
 pcg = PCG64(seed=100)
 rg = RandomGenerator(pcg)
 
-samples = 2000
-npmat = np.zeros((6, 6))
+# Mesh and FS
+mesh = UnitSquareMesh(2, 2)
+V = FunctionSpace(mesh, 'CG', 2)
+VB = FunctionSpace(mesh, ufl.BrokenElement(V.ufl_element()))
+
+samples = 1000
+mass_size = (V.dof_count, V.dof_count)
+brok_size = (VB.dof_count, VB.dof_count)
+npmat = np.zeros(brok_size)
+Hnpmat = np.zeros(mass_size)
 
 for ii in range(samples):
-    mesh = UnitSquareMesh(1, 1)
-    mesh = UnitTriangleMesh()
-    V = FunctionSpace(mesh, 'CG', 2)
-
-    Wnoise = rg.normal(V, 0.0, 1.0)
+    Wnoise = rg.normal(VB, 0.0, 1.0)
+    HWnoise = Function(V)
     u = TrialFunction(V)
     v = TestFunction(V)
 
     # ~ ax[ii].matshow(Wnoise.dat.data.reshape(Wnoise.dat.data.size, 1))
-    print(Wnoise.dat.data)
     #bcs = DirichletBC(V, 0, (1,2,3,4))
 
     # Create mass expression, assemble and extract kernel
@@ -48,7 +52,7 @@ for ii in range(samples):
 
     # Add custom code for doing Cholesky decomp
     blocksize = rhs_ker.kinfo.kernel.code.args[0].shape[0]
-    coordlen = blocksize = rhs_ker.kinfo.kernel.code.args[1].shape[0]
+    coordlen = rhs_ker.kinfo.kernel.code.args[1].shape[0]
 
     cholesky_code = f"""
 extern void dpotrf_(char *UPLO,
@@ -72,7 +76,9 @@ extern void dgemv_(char *TRANS,
 {vec_kernel}
 {mat_kernel}
 
-void apply_cholesky(double *__restrict__ z, double const *__restrict__ coords)
+void apply_cholesky(double *__restrict__ z,
+                    double *__restrict__ b,
+                    double const *__restrict__ coords)
 {{
     char uplo[1];
     int32_t N = {blocksize}, LDA = {blocksize}, INFO = 0;
@@ -84,18 +90,8 @@ void apply_cholesky(double *__restrict__ z, double const *__restrict__ coords)
     int32_t stride = 1;
     double one = 1.0;
     double zero = 0.0;
-    double tmp[{blocksize}] = {{{{ 0.0 }}}};
-    double w_0[{blocksize}] = {{{{ 1.0 }}}};
 
     {mass_ker.kinfo.kernel.name}(H, coords);
-
-    /* for(i=0; i<N; i++){{
-        for(j=0; j<N; j++){{
-            printf("%g\\t", H[N*i+j]);
-        }}
-        printf("\\n");
-    }}
-    printf("\\n"); */
 
     uplo[0] = 'u';
     dpotrf_(uplo, &N, H, &LDA, &INFO);
@@ -104,30 +100,8 @@ void apply_cholesky(double *__restrict__ z, double const *__restrict__ coords)
             if (j>i)
                 H[i*N + j] = 0.0;
 
-
-    /* for(i=0; i<N; i++){{
-        for(j=0; j<N; j++){{
-            printf("%g\\t", H[N*i+j]);
-        }}
-        printf("\\n");
-    }}
-    printf("\\n"); */
-
-    /*{rhs_ker.kinfo.kernel.name}(x, coords, w_0);*/
-
-    for(i=0; i<N; i++){{
-        printf("%g\\t %g\\n", z[i], tmp[i]);
-    }}
-    printf("\\n");
-
     trans[0] = 'T';
-    dgemv_(trans, &N, &N, &one, H, &LDA, z, &stride, &zero, tmp, &stride);
-
-    for(i=0; i<N; i++){{
-        printf("%g\\t %g\\n", z[i], tmp[i]);
-        z[i] = tmp[i];
-    }}
-    printf("\\n");
+    dgemv_(trans, &N, &N, &one, H, &LDA, z, &stride, &zero, b, &stride);
 }}
 """
 
@@ -157,19 +131,26 @@ void apply_cholesky(double *__restrict__ z, double const *__restrict__ coords)
 
     vec_create_op2arg = functools.partial(vector_arg, function=vec, V=test.function_space())
     vec_arg = vec_create_op2arg(op2.RW, get_map, i)
-    vec2_arg = vector_arg(op2.RW, get_map, i, function=Wnoise, V=test.function_space())
+    z_arg = vector_arg(op2.READ, get_map, i, function=Wnoise, V=VB)
+    b_arg = vector_arg(op2.INC, get_map, i, function=HWnoise, V=test.function_space())
 
     domain_number = mass_ker.kinfo.domain_number
     domains = mass.ufl_domains()
     m = domains[domain_number]
     coords = m.coordinates
 
+    DGV = FunctionSpace(mesh, 'DG', 0)
+    dgv = TestFunction(DGV)
+    s = Constant(1.0)*dgv*dx
+    sizes = assemble(s)
+
     op2.par_loop(cholesky_kernel,
                  mesh.cell_set,
-                 vec2_arg,
+                 z_arg,
+                 b_arg,
                  coords.dat(op2.READ, get_map(coords)))
     npmat += np.outer(Wnoise.dat.data, Wnoise.dat.data)
-    print(Wnoise.dat.data)
+    Hnpmat += np.outer(HWnoise.dat.data, HWnoise.dat.data)
 
 
 
@@ -179,13 +160,21 @@ mat.M.assemble()
 
 z = assemble(rhs)
 
-fig, ax = plt.subplots(1, 3)
-Mm = np.ma.masked_values(M.petscmat[:,:], 0, atol=1e-15)
-ax[0].matshow(Mm)
+fig, ax = plt.subplots(2, 3)
+
+Idm = np.ma.masked_values(np.eye(mass_size[0]), 0, atol=1e-15)
+ax[0,0].matshow(Idm)
 npm = np.ma.masked_values(npmat/samples, 0, atol=1e-15)
-ax[1].matshow(npm)
-diffm = np.ma.masked_values(M.petscmat[:,:] - npmat/samples, 0, atol=1e-15)
-ax[2].matshow(diffm)
+ax[0,1].matshow(npm)
+diffm = np.ma.masked_values(np.eye(brok_size[0]) - npmat/samples, 0, atol=1e-15)
+ax[0,2].matshow(diffm)
+
+Mm = np.ma.masked_values(M.petscmat[:,:], 0, atol=1e-15)
+ax[1,0].matshow(Mm)
+Hnpm = np.ma.masked_values(Hnpmat/samples, 0, atol=1e-15)
+ax[1,1].matshow(Hnpm)
+Hdiffm = np.ma.masked_values(M.petscmat[:,:] - Hnpmat/samples, 0, atol=1e-15)
+ax[1,2].matshow(Hdiffm)
 plt.show()
 
 
