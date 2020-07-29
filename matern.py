@@ -1,6 +1,6 @@
 from firedrake import *
 
-from numpy.linalg import cholesky
+from math import ceil
 from scipy.special import gamma
 from firedrake.petsc import PETSc
 from firedrake.assemble import get_vector, vector_arg
@@ -8,37 +8,64 @@ from firedrake.assemble import get_vector, vector_arg
 import ufl
 import numpy as np
 
-def matern(V, variance=1, smoothness=1, correlation_length=1, rng=None):
+def matern(V, mean=0, variance=1, smoothness=1, correlation_length=1, rng=None):
     '''
+    Paper: Croci et al.
+    https://arxiv.org/abs/1803.04857v2
     '''
+    # Check for sensible arguments
+    assert variance > 0
+    assert smoothness > 0
+    assert correlation_length > 0
+
+    # Set symbols to match
     d = V.mesh().topological_dimension()
     nu = smoothness
     sigma = np.sqrt(variance)
     lambd = correlation_length
+    k = ceil((nu + d/2)/2)
 
-    k = (nu + d/2)/2
-    assert k==1
-    kappa = np.sqrt(8)/lambd
-    sigma_hat = gamma(nu)*nu**(d/2)
-    sigma_hat /= gamma(nu + d/2)
-    sigma_hat *= (2/np.pi)**(d/2)
-    sigma_hat *= lambd**(-d)
-    eta = sigma/sigma_hat
+    # Calculate additional parameters
+    kappa = np.sqrt(8*nu)/lambd
+    sigma_hat2 = gamma(nu)*nu**(d/2)
+    sigma_hat2 /= gamma(nu + d/2)
+    sigma_hat2 *= (2/np.pi)**(d/2)
+    sigma_hat2 *= lambd**(-d)
+    eta = sigma/np.sqrt(sigma_hat2)
 
+    # If no random number generator provided make a new one
     if rng is None:
-        pcg = PCG64(seed=100)
+        pcg = PCG64()
         rng = RandomGenerator(pcg)
 
+    # Setup modified Helmholtz problem
     u = TrialFunction(V)
     v = TestFunction(V)
     wnoise = white_noise(V, rng)
-
     a = (inner(u, v) + Constant(1/(kappa**2))*inner(grad(u), grad(v)))*dx
     l = Constant(eta)*inner(wnoise, v)*dx
 
+    # Solve problem once
     u_h = Function(V)
-    solve(a == l, u_h, solver_parameters={'ksp_type': 'cg', 'pc_type': 'gamg'})
+    solver_param = {'ksp_type': 'cg', 'pc_type': 'gamg'}
+    base_problem = LinearVariationalProblem(a, l, u_h)
+    base_solver = LinearVariationalSolver(base_problem,
+                                          solver_parameters=solver_param)
+    base_solver.solve()
 
+    # Iterate until required smoothness achieved
+    if k>1:
+        u_j = Function(V)
+        u_j.assign(u_h)
+        l_j = inner(u_j, v)*dx
+        problem = LinearVariationalProblem(a, l_j, u_h)
+        solver = LinearVariationalSolver(problem,
+                                         solver_parameters=solver_param)
+        for _ in range(k - 1):
+            solver.solve()
+            u_j.assign(u_h)
+
+    u_h.dat.data + mean
     return u_h
 
 def white_noise(V, rng):
@@ -122,10 +149,6 @@ void apply_cholesky(double *__restrict__ z,
 
     z_arg = vector_arg(op2.READ, get_map, i, function=iid_normal, V=Vbrok)
     b_arg = vector_arg(op2.INC, get_map, i, function=wnoise, V=V)
-
-    # ~ domain_number = mass_ker.kinfo.domain_number
-    # ~ domains = mass.ufl_domains()
-    # ~ m = domains[domain_number]
     coords = mesh.coordinates
 
     op2.par_loop(cholesky_kernel,

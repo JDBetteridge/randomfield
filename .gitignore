@@ -1,0 +1,6 @@
+*.out
+*.vtu
+*.pvtu
+*.pvd
+*.png
+__pycache__/
