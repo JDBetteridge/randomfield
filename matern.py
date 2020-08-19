@@ -8,6 +8,8 @@ from firedrake.assemble import get_vector, vector_arg
 import ufl
 import numpy as np
 
+_default_pcg = PCG64()
+
 def matern(V, mean=0, variance=1, smoothness=1, correlation_length=1, rng=None):
     '''
     Paper: Croci et al.
@@ -35,7 +37,7 @@ def matern(V, mean=0, variance=1, smoothness=1, correlation_length=1, rng=None):
 
     # If no random number generator provided make a new one
     if rng is None:
-        pcg = PCG64()
+        pcg = _default_pcg
         rng = RandomGenerator(pcg)
 
     # Setup modified Helmholtz problem
