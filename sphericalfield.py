@@ -9,7 +9,7 @@ V = FunctionSpace(mesh, 'CG', 2)
 rand = matern(V, mean=5, variance=7, smoothness=3, correlation_length=0.5)
 
 fig, ax = plt.subplots(1, 1)
-
-tripcolor(rand, axes=ax)
+cb = tripcolor(rand, axes=ax)
+fig.colorbar(cb, ax=ax)
 
 plt.show()

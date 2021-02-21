@@ -2,7 +2,7 @@ from firedrake import *
 
 from math import ceil
 from scipy.special import gamma
-from firedrake.petsc import PETSc
+from firedrake.petsc import PETSc, get_petsc_variables
 from firedrake.assemble import get_vector, vector_arg
 
 import ufl
@@ -10,7 +10,7 @@ import numpy as np
 
 _default_pcg = PCG64()
 
-def matern(V, mean=0, variance=1, smoothness=1, correlation_length=1, rng=None):
+def matern(V, mean=0, variance=1, smoothness=1, correlation_length=1, rng=None, lognormal=False):
     '''
     Paper: Croci et al.
     https://arxiv.org/abs/1803.04857v2
@@ -20,10 +20,17 @@ def matern(V, mean=0, variance=1, smoothness=1, correlation_length=1, rng=None):
     assert smoothness > 0
     assert correlation_length > 0
 
+    # Log normal rescaling
+    if lognormal:
+        mu = np.log(mean**2/np.sqrt(variance + mean**2))
+        sigma = np.sqrt(np.log(1 + (variance/(mean**2))))
+    else:
+        mu = mean
+        sigma = np.sqrt(variance)
+
     # Set symbols to match
     d = V.mesh().topological_dimension()
     nu = smoothness
-    sigma = np.sqrt(variance)
     lambd = correlation_length
     k = ceil((nu + d/2)/2)
 
@@ -34,6 +41,14 @@ def matern(V, mean=0, variance=1, smoothness=1, correlation_length=1, rng=None):
     sigma_hat2 *= (2/np.pi)**(d/2)
     sigma_hat2 *= lambd**(-d)
     eta = sigma/np.sqrt(sigma_hat2)
+
+    # Print out parameters
+    # ~ print('PARAMETERS:')
+    # ~ print('Mean:', mu, 'Variance:', sigma)
+    # ~ print('Smoothness:', smoothness, 'Correlation length', correlation_length)
+    # ~ print('dimension:', d, 'iterations:', k)
+    # ~ print('kappa:', kappa, 'sigma hat squared:', sigma_hat2, 'eta:', eta)
+    # ~ print('kappa**-2:', 1/(kappa**2))
 
     # If no random number generator provided make a new one
     if rng is None:
@@ -67,18 +82,31 @@ def matern(V, mean=0, variance=1, smoothness=1, correlation_length=1, rng=None):
             solver.solve()
             u_j.assign(u_h)
 
-    u_h.dat.data + mean
+    if lognormal:
+        u_h.dat.data[:] = np.exp(u_h.dat.data + mu)
+    else:
+        u_h.dat.data[:] = u_h.dat.data + mu
     return u_h
 
-def white_noise(V, rng):
+def white_noise(V, rng=None):
     '''
     '''
+    # If no random number generator provided make a new one
+    if rng is None:
+        pcg = _default_pcg
+        rng = RandomGenerator(pcg)
+
     # Create broken space for independent samples
     mesh = V.mesh()
     broken_elements = ufl.MixedElement([ufl.BrokenElement(Vi.ufl_element()) for Vi in V])
     Vbrok = FunctionSpace(mesh, broken_elements)
     iid_normal = rng.normal(Vbrok, 0.0, 1.0)
     wnoise = Function(V)
+
+    # We also need cell volumes for correction
+    DG0 = FunctionSpace(mesh, 'DG', 0)
+    vol = Function(DG0)
+    vol.interpolate(CellVolume(mesh))
 
     # Create mass expression, assemble and extract kernel
     u = TrialFunction(V)
@@ -115,7 +143,8 @@ extern void dgemv_(char *TRANS,
 
 void apply_cholesky(double *__restrict__ z,
                     double *__restrict__ b,
-                    double const *__restrict__ coords)
+                    double const *__restrict__ coords,
+                    double const *__restrict__ volume)
 {{
     char uplo[1];
     int32_t N = {blocksize}, LDA = {blocksize}, INFO = 0;
@@ -125,7 +154,8 @@ void apply_cholesky(double *__restrict__ z,
 
     char trans[1];
     int32_t stride = 1;
-    double one = 1.0;
+    //double one = 1.0;
+    double scale = 1.0/volume[0];
     double zero = 0.0;
 
     {mass_ker.kinfo.kernel.name}(H, coords);
@@ -138,11 +168,24 @@ void apply_cholesky(double *__restrict__ z,
                 H[i*N + j] = 0.0;
 
     trans[0] = 'T';
-    dgemv_(trans, &N, &N, &one, H, &LDA, z, &stride, &zero, b, &stride);
+    dgemv_(trans, &N, &N, &scale, H, &LDA, z, &stride, &zero, b, &stride);
 }}
 """
+    # Get the BLAS and LAPACK compiler parameters to compile the kernel
+    if COMM_WORLD.rank == 0:
+        petsc_variables = get_petsc_variables()
+        BLASLAPACK_LIB = petsc_variables.get("BLASLAPACK_LIB", "")
+        BLASLAPACK_LIB = COMM_WORLD.bcast(BLASLAPACK_LIB, root=0)
+        BLASLAPACK_INCLUDE = petsc_variables.get("BLASLAPACK_INCLUDE", "")
+        BLASLAPACK_INCLUDE = COMM_WORLD.bcast(BLASLAPACK_INCLUDE, root=0)
+    else:
+        BLASLAPACK_LIB = COMM_WORLD.bcast(None, root=0)
+        BLASLAPACK_INCLUDE = COMM_WORLD.bcast(None, root=0)
 
-    cholesky_kernel = op2.Kernel(cholesky_code, "apply_cholesky", ldargs=["-llapack", "-lblas"])
+    cholesky_kernel = op2.Kernel(cholesky_code,
+                                 "apply_cholesky",
+                                 include_dirs=BLASLAPACK_INCLUDE.split(),
+                                 ldargs=BLASLAPACK_LIB.split())
 
     # Construct arguments for par loop
     def get_map(x):
@@ -152,12 +195,14 @@ void apply_cholesky(double *__restrict__ z,
     z_arg = vector_arg(op2.READ, get_map, i, function=iid_normal, V=Vbrok)
     b_arg = vector_arg(op2.INC, get_map, i, function=wnoise, V=V)
     coords = mesh.coordinates
+    volumes = vector_arg(op2.READ, get_map, i, function=vol, V=DG0)
 
     op2.par_loop(cholesky_kernel,
                  mesh.cell_set,
                  z_arg,
                  b_arg,
-                 coords.dat(op2.READ, get_map(coords)))
+                 coords.dat(op2.READ, get_map(coords)),
+                 volumes)
 
     return wnoise
 
