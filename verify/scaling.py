@@ -31,30 +31,30 @@ def _main(args):
         # Using mean and standard deviation parameters
         pcg = PCG64(seed=123)
         # Mat free CG + GMG
-        # ~ solver_opts = {
-            # ~ "ksp_type": "cg",
-            # ~ "pc_type": "mg",
-            # ~ "pc_mg_type": "full",
-            # ~ "mg_levels_ksp_type": "chebyshev",
-            # ~ "mg_levels_ksp_max_it": 2,
-            # ~ "mg_levels_pc_type": "jacobi",
-            # ~ "mg_coarse_pc_type": "python",
-            # ~ "mg_coarse_pc_python_type": "firedrake.AssembledPC",
-            # ~ "mg_coarse_assembled": {
-                # ~ "mat_type": "aij",
-                # ~ "pc_type": "telescope",
-                # ~ "pc_telescope_reduction_factor": tsfactor,
-                # ~ "pc_telescope_subcomm_type": "contiguous",
-                # ~ "telescope_pc_type": "lu",
-                # ~ "telescope_pc_factor_mat_solver_type": "mumps"
-            # ~ }
-        # ~ }
-        # Mat free CG + GMG
         solver_opts = {
-            'snes_view': None,
-            'ksp_type': 'cg',
-            'pc_type': 'gamg'
+            "ksp_type": "cg",
+            "pc_type": "mg",
+            "pc_mg_type": "full",
+            "mg_levels_ksp_type": "chebyshev",
+            "mg_levels_ksp_max_it": 2,
+            "mg_levels_pc_type": "jacobi",
+            "mg_coarse_pc_type": "python",
+            "mg_coarse_pc_python_type": "firedrake.AssembledPC",
+            "mg_coarse_assembled": {
+                "mat_type": "aij",
+                "pc_type": "telescope",
+                "pc_telescope_reduction_factor": tsfactor,
+                "pc_telescope_subcomm_type": "contiguous",
+                "telescope_pc_type": "lu",
+                "telescope_pc_factor_mat_solver_type": "mumps"
+            }
         }
+        # Mat free CG + GMG
+        # ~ solver_opts = {
+            # ~ 'snes_view': None,
+            # ~ 'ksp_type': 'cg',
+            # ~ 'pc_type': 'gamg'
+        # ~ }
         # Just MG
         # ~ solver_opts = {
             # ~ 'snes_view': None,

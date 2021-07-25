@@ -1,15 +1,16 @@
 from argparse import ArgumentParser
-# ~ from firedrake import *
-from mpi4py import MPI
-COMM_WORLD = MPI.COMM_WORLD
+from firedrake import *
 from math import sqrt, ceil
 from scipy.special import gamma
 from scipy.special import kv as bessel2
+from time import time
 
 import numpy as np
 import matplotlib.pyplot as plt
 
 def true_covariance(r, sigma=1, nu=1, lambd=0.2):
+    ''' Expression for evaluating the true covariance of a Matern field
+    '''
     kappa=np.sqrt(8*nu)/lambd
     cov = sigma**2
     cov /= (2**(nu - 1))*gamma(nu)
@@ -18,6 +19,8 @@ def true_covariance(r, sigma=1, nu=1, lambd=0.2):
     return cov
 
 def indicator_f(f, mesh=None):
+    ''' A symbolic indicator function on the unit square/cube
+    '''
     if mesh is None:
         mesh = f.function_space().mesh()
     x = SpatialCoordinate(mesh)
@@ -31,26 +34,23 @@ def indicator_f(f, mesh=None):
 
 def _main(args):
     comm = COMM_WORLD
-    args.variance = 1 # Maybe global ???
 
     if args.data:
+        # If data is passed in populate variables and just plot
         data = np.load(args.data, allow_pickle=True)
-        iterations = data['iterations'][()]
         points = data['points'][()]
         point_vals = data['point_vals'][()]
-        expectation = data['expectation'][()]
+        L2 = data['L2'][()]
         volumes = data['volumes'][()]
     else:
         pcg = PCG64(seed=args.seed)
         rng = RandomGenerator(pcg)
 
         dim = args.dim
-        mesh_size = [2**(r + 1) for r in range(15)]
+        mesh_size = [2**(r + 1) for r in range(4, 15)]
         mesh_size = [m for m in mesh_size if m <= args.maxmesh]
         deg = args.deg
-        iterations = [1, 5] + [10*(ii + 1) for ii in range(args.samples//10)]
-        N = iterations[-1]
-        VAR = 1
+        N = args.samples
         smoothness = args.smoothness
         Npoints = 20
         if comm.rank == 0:
@@ -58,82 +58,145 @@ def _main(args):
         else:
             points = np.zeros((Npoints, dim))
         comm.Bcast(points, root=0)
-        CHOP = args.chop
         volumes = {}
-        expectation = {}
+        L2 = {}
         point_vals = {}
+
+        solver_param = {
+            'ksp_type' : 'cg',
+            'ksp_atol' : 1.0e-10,
+            'ksp_rtol' : 1.0e-12,
+            'ksp_norm_type' : 'unpreconditioned',
+            'ksp_diagonal_scale' : True,
+            'ksp_diagonal_scale_fix' : True,
+            'ksp_reuse_preconditioner' : True,
+            'ksp_max_it' : 1000,
+            'pc_factor_mat_solver_type' : 'mumps',
+            #'ksp_converged_reason' : None,
+            #'ksp_monitor_true_residual' : None,
+            #'ksp_view' : None,
+            'pc_type' : 'hypre',
+            'pc_hypre_boomeramg_strong_threshold' : [0.25, 0.25, 0.6][args.dim - 1],
+            'pc_hypre_type' : 'boomeramg',
+            }
+
         for size in mesh_size:
             if dim == 2:
-                if CHOP:
+                if args.chop:
                     mesh = SquareMesh(size, size, 2)
                     mesh.coordinates.dat.data[:, :] -= 0.5
                 else:
                     mesh = UnitSquareMesh(size, size)
             elif dim == 3:
-                if CHOP:
+                if args.chop:
                     mesh = CubeMesh(size, size, size, 2)
                     mesh.coordinates.dat.data[:, :] -= 0.5
                 else:
                     mesh = UnitCubeMesh(size, size, size)
             V = FunctionSpace(mesh, 'CG', deg)
-            GRF = GaussianRF(V, mu=0, sigma=VAR, smoothness=smoothness, correlation_length=0.2, rng=rng)
+            GRF = GaussianRF(
+                V,
+                mu=0,
+                sigma=args.variance,
+                smoothness=smoothness,
+                correlation_length=0.2,
+                rng=rng,
+                solver_parameters=solver_param
+                )
 
-            sumL2 = 0
+            # Vertex only mesh, to replace at()
+            # ~ vom = VertexOnlyMesh(mesh, points)
+            # ~ W = FunctionSpace(vom, 'DG', 0)
+            # ~ interpolator = Interpolator(TestFunction(V), W)
+
+            L2[size] = np.zeros(N)
             point_vals[size] = np.zeros((N, Npoints))
-            expectation[size] = []
             sample = indicator_f(Constant(1.0), mesh=mesh)
             volumes[size] = assemble(dot(sample, sample) * dx(domain=mesh))
 
             if comm.rank == 0:
                 print('Mesh size:', size)
+                runtime = time()
             for ii in range(N):
                 sample = GRF.sample()
                 point_vals[size][ii, :] = sample.at(points)
+                # ~ w = interpolator.interpolate(sample)
+                # ~ point_vals[size][ii, :] = w.dat.data_ro
                 sample = indicator_f(sample)
-                sumL2 += assemble(dot(sample, sample) * dx)
-                if ii + 1 in iterations:
-                    expectation[size].append(sumL2/(ii + 1))
+                L2[size][ii] = assemble(dot(sample, sample) * dx)
                 if ii%(N//10) == 0 and comm.rank == 0:
                     print(100*(ii/N), '%', end=' ', flush=True)
 
-            expectation[size] = np.array(expectation[size])
             if comm.rank == 0:
                 print('100 %')
-            EL2 = sumL2/N
+                runtime = time() - runtime
+                print('Runtime : ', runtime, 's')
 
         if comm.rank == 0:
             npzname = f'{args.dim}D_P{args.deg}_single_cvg{args.samples}'
             if args.seed != 123:
                 npzname += f'_seed{args.seed}'
             np.savez_compressed(npzname,
-                                iterations=iterations,
                                 points=points,
                                 point_vals=point_vals,
-                                expectation=expectation,
+                                L2=L2,
                                 volumes=volumes)
 
     if comm.rank == 0:
-        plot_data(args, iterations, points, point_vals, expectation, volumes)
+        plot_data(args, points, point_vals, L2, volumes)
 
-def plot_data(args, iterations, points, point_vals, expectation, volumes):
+def plot_data(args, points, point_vals, L2, volumes):
     factor = 2 if args.chop else 1
-    mesh_size = [k for k in expectation.keys()]
-    res = np.array([expectation[s] for s in mesh_size])
-    ones = np.ones(len(iterations))
+    mesh_size = [k for k in L2.keys()]
+    L2 = np.array([L2[s] for s in mesh_size])
+    iterations = np.arange(1, L2.shape[1]+1)
+    ones = np.ones_like(L2[0])
     vols = np.array([volumes[s] for s in mesh_size])
-    analytic = np.abs(res - args.variance*np.outer(vols, ones))
-    approx = np.abs(res - np.outer(res[:,-1], ones))
 
-    breakpoint()
+    # In Monte Carlo notation the L2 norms we have found correspond
+    # to the variable P_l
+    Pl = L2
 
-    for ii, (res, txt) in enumerate(zip([analytic, approx], ['\sigma^2|G|', '|| u_f ||_{{L^2}}'])):
+    P_mean = np.mean(Pl, axis=1)
+    P_var = np.var(Pl, axis=1)
+    P_cumean = np.cumsum(Pl, axis=1)/iterations
+    P_cuvar = np.cumsum((Pl - P_cumean)**2, axis=1)/iterations
+    P_cuCI = 3*np.sqrt(P_cuvar/iterations)
+
+    analytic = np.abs(P_cumean - args.variance*np.outer(vols, ones))
+    approx = np.abs(P_cumean - np.outer(P_mean, ones))
+    approx[:, -1] = np.nan
+
+    for ii, (res, txt) in enumerate(zip([analytic, approx], ['\sigma^2|G|', '|| u_f ||_{{L^2}}^2'])):
         fig, ax = plt.subplots(1, 1)
         fig.set_size_inches(6, 6)
-        ax.loglog(iterations, res.T)
+        # Data
+        ax.plot(res.T)
+        # Add confidence intervals
+        ax.set_prop_cycle(None)
+        ax.plot(+3*np.sqrt(np.outer(P_var, 1/iterations)).T, ls='--', lw=1)
+        ax.set_prop_cycle(None)
+        ax.plot(-3*np.sqrt(np.outer(P_var, 1/iterations)).T, ls='--', lw=1)
+        # Labels and legends
         ax.legend(np.array(mesh_size)/factor, title='Mesh Size')
         ax.set_xlabel('Samples')
-        ax.set_ylabel(f'$|\mathbb{{E}}[|| u ||_{{L^2}} - {txt}]|$')
+        ax.set_ylabel(f'$|\mathbb{{E}}[|| u ||_{{L^2}}^2 - {txt}]|$')
         pngname = f'{args.dim}D_P{args.deg}_single_cvg{args.samples}_{ii}'
+        if args.seed != 123:
+            pngname += f'_seed{args.seed}'
+        pngname += '.png'
+        fig.savefig(pngname, bbox_inches='tight', dpi=300)
+
+    for ii, (res, txt) in enumerate(zip([analytic, approx], ['\sigma^2|G|', '|| u_f ||_{{L^2}}^2'])):
+        fig, ax = plt.subplots(1, 1)
+        fig.set_size_inches(6, 6)
+        ax.loglog(res[-1])
+        ax.loglog(+3*np.sqrt(P_var[-1]/iterations), 'k--')
+        ax.loglog(-3*np.sqrt(P_var[-1]/iterations), 'k--')
+        ax.legend([np.array(mesh_size[-1])/factor], title='Mesh Size')
+        ax.set_xlabel('Samples')
+        ax.set_ylabel(f'$|\mathbb{{E}}[|| u ||_{{L^2}}^2 - {txt}]|$')
+        pngname = f'finest_{args.dim}D_P{args.deg}_single_cvg{args.samples}_{ii}'
         if args.seed != 123:
             pngname += f'_seed{args.seed}'
         pngname += '.png'
@@ -150,13 +213,13 @@ def plot_data(args, iterations, points, point_vals, expectation, volumes):
         dist[ii, :] = np.linalg.norm(points - p, axis=1)
     dist = np.tril(dist).ravel()
     dist = dist[dist>0]
-    ind = np.argsort(dist)
     rmin = np.min(dist)
     rmax = np.max(dist)
     rspace = np.linspace(rmin, rmax, 100)
 
     for size, ax in zip(mesh_size, axb.ravel()):
         covar = np.cov(point_vals[size].T)
+        # ~ var = np.diag(covar)
         cvlist = np.tril(covar, -1).ravel()
         cvlist = cvlist[cvlist!=0]
 
@@ -208,6 +271,10 @@ parser.add_argument('--chop',
                     default=False,
                     action='store_true',
                     help='Remove boundary')
+parser.add_argument('--variance',
+                    default=1,
+                    type=float,
+                    help='Variance (probably don\'t change this)')
 
 
 if __name__ == '__main__':

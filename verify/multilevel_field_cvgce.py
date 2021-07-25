@@ -1,9 +1,10 @@
 from argparse import ArgumentParser
 from firedrake import *
-from math import ceil, floor, sqrt
+from time import time
 
 import numpy as np
 import matplotlib.pyplot as plt
+
 
 def indicator_f(f, mesh=None):
     if mesh is None:
@@ -17,11 +18,12 @@ def indicator_f(f, mesh=None):
         product *= interval1(x[ii], 0, 1)
     return product
 
+
 def _main(args):
     comm = COMM_WORLD
-    args.variance = 1 # Maybe global ???
 
     if args.data:
+        # If data is passed in populate variables and just plot
         data = np.load(args.data, allow_pickle=True)
         volume = data['volume'][()]
         coarse_data = data['coarse_data'][()]
@@ -30,37 +32,49 @@ def _main(args):
         pcg = PCG64(seed=args.seed)
         rng = RandomGenerator(pcg)
 
-        CHOP = args.chop
+        # Construct hierarchy of meshes, with padded boundary if chop specified
         dim = args.dim
         levels = args.levels
         if dim == 2:
-            if CHOP:
+            if args.chop:
                 mesh = SquareMesh(args.baseN, args.baseN, 2)
             else:
                 mesh = UnitSquareMesh(args.baseN, args.baseN)
         elif dim == 3:
-            if CHOP:
+            if args.chop:
                 mesh = CubeMesh(args.baseN, args.baseN, args.baseN, 2)
             else:
                 mesh = UnitCubeMesh(args.baseN, args.baseN, args.baseN)
         mh = MeshHierarchy(mesh, levels - 1)
-        if CHOP:
+        if args.chop:
             for m in mh:
                 m.coordinates.dat.data[:, :] -= 0.5
         deg = args.deg
         smoothness = args.smoothness
         N = args.samples
-        VAR = 1
 
         volume = {}
         fine_data = {}
         coarse_data = {}
 
         for l in range(levels - 1):
+            # Set up random field on each level
             fine_mesh = mh[l + 1]
             V_f = FunctionSpace(fine_mesh, 'CG', deg)
-            GRF = GaussianRF(V_f, mu=0, sigma=VAR, correlation_length=0.2, smoothness=smoothness, rng=rng,
-                            solver_parameters={'ksp_type': 'cg', 'pc_type': 'gamg', 'pc_gamg_threshold': -1})
+            param = {
+                'ksp_type': 'cg',
+                'pc_type': 'gamg',
+                'pc_gamg_threshold': -1
+            }
+            GRF = GaussianRF(
+                V_f,
+                mu=0,
+                sigma=args.variance,
+                correlation_length=0.2,
+                smoothness=smoothness,
+                rng=rng,
+                solver_parameters=param
+                )
 
             coarse_mesh = mh[l]
             V_c = FunctionSpace(coarse_mesh, 'CG', deg)
@@ -74,13 +88,16 @@ def _main(args):
 
             if COMM_WORLD.rank == 0:
                 print('Level:', l)
+                runtime = time()
             for ii in range(N):
+                # Draw a sample on the fine mesh and inject to coarse mesh
                 sample_f = GRF.sample()
                 inject(sample_f, sample_c)
 
                 s_f = indicator_f(sample_f)
                 s_c = indicator_f(sample_c)
 
+                # Measure and record the L2-norm squared
                 fine_L2[ii] = assemble(dot(s_f, s_f) * dx)
                 coarse_L2[ii] = assemble(dot(s_c, s_c) * dx)
 
@@ -88,10 +105,13 @@ def _main(args):
                     print(100*(ii/N), '%', end=' ', flush=True)
             if COMM_WORLD.rank == 0:
                 print('100 %')
+                runtime = time() - runtime
+                print('Runtime : ', runtime, 's')
 
             fine_data[l] = fine_L2
             coarse_data[l] = coarse_L2
 
+        # Save the array of L2 norms as checkpointing
         if comm.rank == 0:
             npzname = f'{args.dim}D_{args.baseN}_{args.levels}_P{args.deg}_ml_cvg{args.samples}'
             if args.seed != 123:
@@ -102,73 +122,81 @@ def _main(args):
                                 volume=volume)
 
     if comm.rank == 0:
-        # ~ results = [[0.12346840206238908, 0.0003043586021762483], [0.08947201607111559, 3.3405144111472866e-05], [0.04621505923167558, 5.054948927653155e-06], [0.01903046224171108, 3.396593296162226e-07]]
         plot_data(args, volume, fine_data, coarse_data)
-
-def var_exp(a, axis=1, dtype=None, out=None, ddof=0):
-    assert len(a.shape) == 2
-    n = a.shape[axis]
-    expn = ceil(sqrt(n))
-    varn = floor(n/expn)
-
-    if expn*varn != n:
-        print(f'Warning: Throwing {n - expn*varn} samples away!')
-
-    stack = a[:, :expn*varn].reshape(-1, varn, expn)
-    return np.var(np.mean(stack, axis=2), axis=1)
-
-def exp_var(a, axis=1, dtype=None, out=None, ddof=0):
-    assert len(a.shape) == 2
-    n = a.shape[axis]
-    varn = ceil(sqrt(n))
-    expn = floor(n/varn)
-
-    if expn*varn != n:
-        print(f'Warning: Throwing {n - expn*varn} samples away!')
-
-    stack = a[:, :expn*varn].reshape(-1, expn, varn)
-    return np.mean(np.var(stack, axis=2), axis=1)
 
 
 def plot_data(args, volume, fine_data, coarse_data):
+    try:
+        from scipy.stats import kurtosis
+    except ImportError:
+        # Gives same values as scipy for test values
+        kurtosis = lambda x: np.mean((x - np.outer(np.mean(x, axis=1), np.ones_like(x[0])))**4, axis=1)/(np.var(x, axis=1)**2)
     levels = len(fine_data.keys())
     vol = np.array([v for v in volume.values()])
     fine = np.array([v for v in fine_data.values()])
     coarse = np.array([v for v in coarse_data.values()])
+
+    # Statistics in MLMC are often calculated in terms of
+    # Y_l = P_l      - P_{l-1}
+    #     = P_l^f    - P_{l-1}^c
+    #     = P_l^f(w) - P_{l-1}^c(w)
+    # where l denotes the level and c or f denotes fine or coarse
+    # w (in place of \omega) denotes the statistic is generated
+    # from the same sample
+    Y = fine - coarse
+    Pl = fine
+
     ones = np.ones_like(fine[0, :])
     true_exp = np.abs(np.mean(args.variance*np.outer(vol, ones) - coarse, axis=1))
-    num_exp = np.abs(np.mean(fine - coarse, axis=1))
-    variance = np.var(fine - coarse, axis=1)
+    Y_mean = np.mean(Y, axis=1)
+    Y_var = np.var(Y, axis=1)
 
+    # P_l statistics
+    print('P_l statistics')
+    P_mean = np.mean(Pl, axis=1)
+    P_var = np.var(Pl, axis=1)
+    print('Mean       : ', ' & '.join(f'{s:6.4g}' for s in P_mean))
+    print('Variance   : ', ' & '.join(f'{s:6.4g}' for s in P_var))
+
+    # Y_l statistics
     # Consistency check
-    print('Consistency check:')
-    a = np.mean(fine - coarse, axis=1)
-    b = np.mean(fine, axis=1)
-    c = np.mean(coarse, axis=1)
+    print('Y_l statistics')
+    fine_exp = np.mean(fine, axis=1)
+    a = Y_mean[1:]
+    b = fine_exp[1:]
+    c = fine_exp[:-1]
     abc = a - b + c
-    print('a - b + c = ', ' & '.join(f'{s:6.4g}' for s in abc))
-    Va = var_exp(fine - coarse)
-    Vb = var_exp(fine)
-    Vc = var_exp(coarse)
-    tabc = np.abs(abc)/(3*(np.sqrt(Va) + np.sqrt(Vb) + np.sqrt(Vc)))
+    print('a - b + c  = ', ' & '.join(f'{s:6.4g}' for s in abc))
+    fine_var = np.var(fine, axis=1)
+    Va = Y_var[1:]
+    Vb = fine_var[1:]
+    Vc = fine_var[:-1]
+    N = Y.shape[1]
+    tabc = np.sqrt(N)*np.abs(abc)/(3*(np.sqrt(Va) + np.sqrt(Vb) + np.sqrt(Vc)))
     print('T(a, b, c) = ', ' & '.join(f'{s:6.4g}' for s in tabc))
 
     # Kurtosis
-    k = exp_var((fine - coarse)**4)/(exp_var((fine - coarse)**2)**2)
-    print('Kurtosis: ', ' & '.join(f'{s:6.4g}' for s in k))
+    Y_kurt = kurtosis(fine - coarse, axis=1, fisher=False)
+    print('Mean       : ', ' & '.join(f'{s:6.4g}' for s in Y_mean))
+    print('Variance   : ', ' & '.join(f'{s:6.4g}' for s in Y_var))
+    print('Kurtosis   : ', ' & '.join(f'{s:6.4g}' for s in Y_kurt))
 
-    fig, axes = plt.subplots(1, 3)
-    fig.set_size_inches(10, 6)
+    fig, axes = plt.subplots(2, 3)
+    fig.set_size_inches(10, 10)
+
+    # Convergence plots
     p = (4 - args.dim)*args.deg
     if args.dim == 2:
         q = 2*p
     else:
         q = 2*(args.deg + 1)
     domain_length = 2 if args.chop else 1
-    for res, ax, power in zip([true_exp, num_exp, variance], axes.ravel(), [p, p, q]):
-        xs = [(domain_length/args.baseN)*2**(-l) for l in range(levels)]
+    xs = [(domain_length/args.baseN)*2**(-l) for l in range(levels)]
+    for res, ax, power in zip([true_exp, np.abs(Y_mean), Y_var], axes[0].ravel(), [p, p, q]):
+        # Data
         ax.loglog(xs, res.T)
         #power = p*(4 - args.dim)
+        # Rate
         ax.loglog(xs, [2*(x**power)/(xs[-1]**power)*res[-1] for x in xs], 'k--')
 
         pos = (xs[-2], 2*(xs[-2]**power)/(xs[-1]**power)*res[-1])
@@ -184,10 +212,19 @@ def plot_data(args, volume, fine_data, coarse_data):
         ax.set_xlabel('$h_l$')
         ax.invert_xaxis()
 
+    axes[0, 0].set_ylabel('$|\mathbb{E}[\sigma^2|G| - || u_{l-1} ||_{L^2}^2]|$')
+    axes[0, 1].set_ylabel('$|\mathbb{E}[|| u_l ||_{L^2}^2 - || u_{l-1} ||_{L^2}^2]|$')
+    axes[0, 2].set_ylabel('$|\mathbb{V}[|| u_l ||_{L^2}^2 - || u_{l-1} ||_{L^2}^2]|$')
 
-    axes[0].set_ylabel('$|\mathbb{E}[\sigma^2|G| - || u_{l-1} ||_{L^2}]|$')
-    axes[1].set_ylabel('$|\mathbb{E}[|| u_l ||_{L^2} - || u_{l-1} ||_{L^2}]|$')
-    axes[2].set_ylabel('$|\mathbb{V}[|| u_l ||_{L^2} - || u_{l-1} ||_{L^2}]|$')
+    # Consistency and kurtosis
+    axes[1, 0].plot(range(1, levels), tabc)
+    axes[1, 0].set_xlabel('Level')
+    axes[1, 0].set_ylabel('Consistency $T(a,b,c)$')
+
+    axes[1, 1].plot(range(levels), Y_kurt)
+    axes[1, 1].set_xlabel('Level')
+    axes[1, 1].set_ylabel('Kurtosis')
+
     fig.suptitle(f'{args.dim}D multilevel field convergence with P{args.deg} elements\n Using {args.samples} samples per level')
     fig.subplots_adjust(wspace=0.4)
     pngname = f'{args.dim}D_{args.baseN}_{args.levels}_P{args.deg}_ml_cvg{args.samples}'
@@ -235,6 +272,10 @@ parser.add_argument('--chop',
                     default=False,
                     action='store_true',
                     help='Remove boundary')
+parser.add_argument('--variance',
+                    default=1,
+                    type=float,
+                    help='Variance (probably don\'t change this)')
 
 
 if __name__ == '__main__':
